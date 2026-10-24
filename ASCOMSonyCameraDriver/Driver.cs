@@ -179,16 +179,26 @@ namespace ASCOM.SonyMirrorless
                 {
                     WriteProfile(); // Persist device configuration values to the ASCOM Profile store
 
-                    // Update connected camera with bulb mode info
+                    // Update connected camera with the new settings
                     if (camera != null)
                     {
-                        camera.BulbMode = BulbModeEnable;
-                        camera.BulbModeTime = BulbModeTime;
+                        ApplySettingsToCamera();
                     }
                 }
             }
 
             LogMessage("SetupDialog", "[out]");
+        }
+
+        /// <summary>
+        /// Push the settings from the setup dialog/profile into the camera object
+        /// </summary>
+        private static void ApplySettingsToCamera()
+        {
+            // defaultReadoutMode is one of the OUTPUTFORMAT_ values: RGGB is raw, RGB and BGR are both processed RGB
+            camera.OutputMode = defaultReadoutMode == SonyCommon.OUTPUTFORMAT_RGGB ? SonyCamera.ImageMode.RGGB : SonyCamera.ImageMode.RGB;
+            camera.BulbMode = BulbModeEnable;
+            camera.BulbModeTime = BulbModeTime;
         }
 
         public ArrayList SupportedActions
@@ -324,19 +334,7 @@ namespace ASCOM.SonyMirrorless
                                     cameraNumX = (int)(camera.Info.CropMode == 0 ? camera.Info.ImageWidthPixels : camera.Info.ImageWidthCroppedPixels);
                                     cameraNumY = (int)(camera.Info.CropMode == 0 ? camera.Info.ImageHeightPixels : camera.Info.ImageHeightCroppedPixels);
 
-                                    switch (defaultReadoutMode)
-                                    {
-                                        case 0:
-                                            camera.OutputMode = SonyCamera.ImageMode.RGB;
-                                            break;
-
-                                        case 1:
-                                            camera.OutputMode = SonyCamera.ImageMode.RGGB;
-                                            break;
-                                    }
-
-                                    camera.BulbMode = BulbModeEnable;
-                                    camera.BulbModeTime = BulbModeTime;
+                                    ApplySettingsToCamera();
                                 }
                             }
 
@@ -554,9 +552,12 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_CameraState", true))
                 {
-                    tl.LogMessage("CameraState Get", camera.State.ToString());
+                    // Read once - each read polls the DLL, so logging and returning separate reads could disagree
+                    CameraStates state = camera.State;
 
-                    return camera.State;
+                    tl.LogMessage("CameraState Get", state.ToString());
+
+                    return state;
                 }
             }
         }
@@ -976,7 +977,8 @@ namespace ASCOM.SonyMirrorless
                             break;
 
                         case 2:
-                            if (Personality != SonyCommon.PERSONALITY_NINA)
+                            // Use the personality the image was converted with - the setting may have changed since
+                            if (image.Personality != SonyCommon.PERSONALITY_NINA)
                             {
                                 tl.LogMessage("RGB info", String.Format("Dimensions = {0}, {1} x {2} x {3}", SonyImage.RGB.Rank, SonyImage.RGB.GetLength(0), SonyImage.RGB.GetLength(1), SonyImage.RGB.GetLength(2)));
 
@@ -1126,7 +1128,9 @@ namespace ASCOM.SonyMirrorless
                         throw new ASCOM.InvalidOperationException("Call to LastExposureStartTime before the first image has been taken!");
                     }
 
-                    string exposureStartString = camera.LastImage.StartTime.ToString("yyyy-MM-ddTHH:mm:ss");
+                    // ASCOM requires UTC. Invariant culture because ':' in a format string is the culture's time
+                    // separator, which isn't ':' everywhere
+                    string exposureStartString = camera.LastImage.StartTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
                     tl.LogMessage("LastExposureStartTime Get", exposureStartString.ToString());
                     return exposureStartString;
                 }
@@ -1139,8 +1143,19 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_MaxADU", true))
                 {
-                    int bpp = (int)camera.Info.BitsPerPixel;
-                    int maxADU = (1 << bpp) - 1;
+                    int maxADU;
+
+                    if (camera.OutputMode == SonyCamera.ImageMode.RGB && !camera.PreviewMode)
+                    {
+                        // Processed RGB data comes out of libraw as full 16-bit values, not sensor bit depth
+                        maxADU = 65535;
+                    }
+                    else
+                    {
+                        // Bit depth comes from the registry, so guard against values that would make this 0 or overflow
+                        int bpp = (int)camera.Info.BitsPerPixel;
+                        maxADU = bpp >= 1 && bpp <= 16 ? (1 << bpp) - 1 : 65535;
+                    }
 
                     tl.LogMessage("MaxADU Get", maxADU.ToString());
 
@@ -1338,18 +1353,19 @@ namespace ASCOM.SonyMirrorless
                 using (new SerializedAccess(this, "get_ReadoutModes", true))
                 {
                     ArrayList modes = new ArrayList();
+                    SonyCommon.CameraInfo resolutions = camera.Resolutions;
 
-                    modes.Add(String.Format("Full Resolution ({0} x {1})", camera.Resolutions.ImageWidthPixels, camera.Resolutions.ImageHeightPixels));
+                    modes.Add(String.Format("Full Resolution ({0} x {1})", resolutions.ImageWidthPixels, resolutions.ImageHeightPixels));
 
                     if (camera.HasLiveView)
                     {
                         if (Personality == SonyCommon.PERSONALITY_NINA)
                         {
-                            modes.Add(String.Format("LiveView ({0} x {1}) [Mono]", camera.Resolutions.PreviewWidthPixels, camera.Resolutions.PreviewHeightPixels));
+                            modes.Add(String.Format("LiveView ({0} x {1}) [Mono]", resolutions.PreviewWidthPixels, resolutions.PreviewHeightPixels));
                         }
                         else
                         {
-                            modes.Add(String.Format("LiveView ({0} x {1})", camera.Resolutions.PreviewWidthPixels, camera.Resolutions.PreviewHeightPixels));
+                            modes.Add(String.Format("LiveView ({0} x {1})", resolutions.PreviewWidthPixels, resolutions.PreviewHeightPixels));
                         }
                     }
 
@@ -1421,8 +1437,6 @@ namespace ASCOM.SonyMirrorless
             using (new SerializedAccess(this, "StartExposure()", true))
             {
                 if (Duration < 0.0) throw new InvalidValueException("StartExposure", Duration.ToString(), "0.0 upwards");
-                if (StartX + NumX > camera.Mode.ImageWidthPixels) throw new InvalidValueException("StartExposure", cameraNumX.ToString(), camera.Info.ImageWidthPixels.ToString());
-                if (StartY + NumY > camera.Mode.ImageHeightPixels) throw new InvalidValueException("StartExposure", cameraNumY.ToString(), camera.Info.ImageHeightPixels.ToString());
 
                 if (!LastSetFastReadout)
                 {
@@ -1436,6 +1450,11 @@ namespace ASCOM.SonyMirrorless
                         camera.PreviewMode = false;
                     }
                 }
+
+                // Check the subframe against the mode we're actually about to use - checking before the switch
+                // above compared full-resolution coordinates against the liveview size (or vice versa)
+                if (StartX + NumX > camera.Mode.ImageWidthPixels) throw new InvalidValueException("StartExposure", cameraNumX.ToString(), camera.Mode.ImageWidthPixels.ToString());
+                if (StartY + NumY > camera.Mode.ImageHeightPixels) throw new InvalidValueException("StartExposure", cameraNumY.ToString(), camera.Mode.ImageHeightPixels.ToString());
 
                 tl.LogMessage("StartExposure", String.Format("Duration={0}, Light={1}", Duration.ToString(), Light.ToString()));
 

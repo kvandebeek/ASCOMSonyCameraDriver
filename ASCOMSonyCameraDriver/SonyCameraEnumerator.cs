@@ -16,10 +16,13 @@ namespace ASCOM.SonyMirrorless
                 ArrayList result = new ArrayList();
                 UInt32 count = GetPortableDeviceCount();
                 UInt32 hr;
-                PortableDeviceInfo portableDeviceInfo = new PortableDeviceInfo();
 
                 for (UInt32 iter = 0; iter < count; iter++)
                 {
+                    // Must be fresh each time - reusing it would marshal the previous device's strings in,
+                    // and the DLL overwrites those pointers without freeing them
+                    PortableDeviceInfo portableDeviceInfo = new PortableDeviceInfo();
+
                     hr = GetPortableDeviceInfo(iter, ref portableDeviceInfo);
 
                     if (hr == ERROR_SUCCESS)

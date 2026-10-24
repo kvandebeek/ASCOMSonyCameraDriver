@@ -40,17 +40,18 @@ Source: "C:\Users\dougf\source\repos\ASCOMSonyCameraDriver\ASCOMSonyCameraDriver
 
 ; TODO: Add other files needed by your driver here (add subfolders above)
 ; 32-bit files
-Source: "C:\Users\dougf\source\repos\SonyCamera\Release\libraw.dll"; DestDir: "{sys}"; Flags: 32bit
-Source: "C:\Users\dougf\source\repos\SonyCamera\Release\SonyMTPCamera.dll"; DestDir: "{sys}"; Flags: 32bit
-Source: "C:\Users\dougf\source\repos\SonyCamera\Release\turbojpeg.dll"; DestDir: "{sys}"; Flags: 32bit
-Source: "C:\Users\dougf\source\repos\SonyCamera\Release\libusbK.dll"; DestDir: "{sys}"; Flags: 32bit
+; System32 DLLs are flagged sharedfile so uninstalling doesn't delete a libusbK.dll/turbojpeg.dll that other software also uses
+Source: "C:\Users\dougf\source\repos\SonyCamera\Release\libraw.dll"; DestDir: "{sys}"; Flags: 32bit sharedfile
+Source: "C:\Users\dougf\source\repos\SonyCamera\Release\SonyMTPCamera.dll"; DestDir: "{sys}"; Flags: 32bit sharedfile
+Source: "C:\Users\dougf\source\repos\SonyCamera\Release\turbojpeg.dll"; DestDir: "{sys}"; Flags: 32bit sharedfile
+Source: "C:\Users\dougf\source\repos\SonyCamera\Release\libusbK.dll"; DestDir: "{sys}"; Flags: 32bit sharedfile
 Source: "C:\Users\dougf\source\repos\SonyCamera\Release\SonyCameraInfo.exe"; DestDir: "{app}"
 
 ; 64-bit files
-Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\libraw.dll"; DestDir: "{sys}"; Flags: 64bit; Check: IsWin64
-Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\SonyMTPCamera.dll"; DestDir: "{sys}"; Flags: 64bit; Check: IsWin64
-Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\turbojpeg.dll"; DestDir: "{sys}"; Flags: 64bit; Check: IsWin64
-Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\libusbK.dll"; DestDir: "{sys}"; Flags: 64bit; Check: IsWin64
+Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\libraw.dll"; DestDir: "{sys}"; Flags: 64bit sharedfile; Check: IsWin64
+Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\SonyMTPCamera.dll"; DestDir: "{sys}"; Flags: 64bit sharedfile; Check: IsWin64
+Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\turbojpeg.dll"; DestDir: "{sys}"; Flags: 64bit sharedfile; Check: IsWin64
+Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\libusbK.dll"; DestDir: "{sys}"; Flags: 64bit sharedfile; Check: IsWin64
 Source: "C:\Users\dougf\source\repos\SonyCamera\x64\Release\SonyCameraInfo64.exe"; DestDir: "{app}"
 
 ; AnyCPU files

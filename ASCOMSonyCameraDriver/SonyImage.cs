@@ -18,7 +18,7 @@ namespace ASCOM.SonyMirrorless
         internal ImageInfo m_info;
         internal UInt32 m_cameraHandle;
         internal TraceLogger m_logger;
-        public DateTime StartTime = DateTime.Now;
+        public DateTime StartTime;
         private int m_personality;
         private short m_readoutMode;
 
@@ -29,13 +29,15 @@ namespace ASCOM.SonyMirrorless
         public static int[,,] RGB;
         public static int[,] BAYER;
 
-        public SonyImage(UInt32 handle, ImageInfo info, int personality, short readoutMode, TraceLogger logger)
+        /// <param name="startTime">UTC time the exposure was started</param>
+        public SonyImage(UInt32 handle, ImageInfo info, int personality, short readoutMode, TraceLogger logger, DateTime startTime)
         {
             m_cameraHandle = handle;
             m_logger = logger;
             m_info = info;
             m_personality = personality;
             m_readoutMode = readoutMode;
+            StartTime = startTime;
             Status = SonyImage.ImageStatus.Capturing;
 
             if (m_info.Status == STATUS_COMPLETE)
@@ -125,6 +127,17 @@ namespace ASCOM.SonyMirrorless
             }
         }
 
+        /// <summary>
+        /// Personality the image was converted for - decides whether RGB data went into BAYER (mono) or RGB
+        /// </summary>
+        public int Personality
+        {
+            get
+            {
+                return m_personality;
+            }
+        }
+
         public void ProcessImageData()
         {
             Log("Processing Image Data - in");
@@ -164,10 +177,13 @@ namespace ASCOM.SonyMirrorless
                     throw new ASCOM.DriverException(String.Format("Image data is incomplete: got {0} bytes, expected {1} for {2} x {3}", m_info.ImageSize, expectedSize, Width, Height));
                 }
 
-                // Copy one row at a time rather than the whole image - a full-size copy of a 60MP
-                // RGB image is 360MB, which 32-bit hosts frequently can't allocate
+                // Work through the image a band of rows at a time rather than copying the whole image - a
+                // full-size copy of a 60MP RGB image is 360MB, which 32-bit hosts frequently can't allocate.
+                // The output arrays are [x, y] so consecutive y values are adjacent in memory; walking each
+                // band column by column keeps the writes close together instead of striding across the array.
                 int rowBytes = Width * bytesPerPixel;
-                byte[] row = new byte[rowBytes];
+                int bandRows = Math.Max(1, Math.Min(Height, 32));
+                byte[] band = new byte[bandRows * rowBytes];
 
                 switch (m_info.ImageMode)
                 {
@@ -180,19 +196,22 @@ namespace ASCOM.SonyMirrorless
 
                         int mi = int.MaxValue, ma = int.MinValue;
 
-                        for (int y = 0; y < Height; y++)
+                        for (int y0 = 0; y0 < Height; y0 += bandRows)
                         {
-                            Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
+                            int rows = Math.Min(bandRows, Height - y0);
 
-                            int destY = Height - y - 1;
+                            Marshal.Copy(IntPtr.Add(m_info.ImageData, y0 * rowBytes), band, 0, rows * rowBytes);
 
-                            for (int x = 0, i = 0; x < Width; x++, i += 2)
+                            for (int x = 0; x < Width; x++)
                             {
-                                int v = row[i] + (row[i + 1] << 8);
+                                for (int r = 0, i = x * 2; r < rows; r++, i += rowBytes)
+                                {
+                                    int v = band[i] + (band[i + 1] << 8);
 
-                                if (v < mi) { mi = v; }
-                                if (v > ma) { ma = v; }
-                                BAYER[x, destY] = v;
+                                    if (v < mi) { mi = v; }
+                                    if (v > ma) { ma = v; }
+                                    BAYER[x, Height - (y0 + r) - 1] = v;
+                                }
                             }
                         }
 
@@ -210,18 +229,23 @@ namespace ASCOM.SonyMirrorless
                                 BAYER = new int[Width, Height];
                             }
 
-                            for (int y = 0; y < Height; y++)
+                            for (int y0 = 0; y0 < Height; y0 += bandRows)
                             {
-                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
+                                int rows = Math.Min(bandRows, Height - y0);
 
-                                for (int x = 0, i = 0; x < Width; x++, i += 6)
+                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y0 * rowBytes), band, 0, rows * rowBytes);
+
+                                for (int x = 0; x < Width; x++)
                                 {
-                                    int r = row[i] + (row[i + 1] << 8);
-                                    int g = row[i + 2] + (row[i + 3] << 8);
-                                    int b = row[i + 4] + (row[i + 5] << 8);
+                                    for (int r = 0, i = x * 6; r < rows; r++, i += rowBytes)
+                                    {
+                                        int red = band[i] + (band[i + 1] << 8);
+                                        int green = band[i + 2] + (band[i + 3] << 8);
+                                        int blue = band[i + 4] + (band[i + 5] << 8);
 
-                                    // Previously cast to short, which wrapped bright pixels (> 32767) to negative values
-                                    BAYER[x, y] = Math.Min(65535, (int)((0.2125 * r) + (0.7154 * g) + (0.0721 * b)));
+                                        // Previously cast to short, which wrapped bright pixels (> 32767) to negative values
+                                        BAYER[x, y0 + r] = Math.Min(65535, (int)((0.2125 * red) + (0.7154 * green) + (0.0721 * blue)));
+                                    }
                                 }
                             }
                         }
@@ -236,17 +260,22 @@ namespace ASCOM.SonyMirrorless
                             int bIndex = 2 - rIndex;
                             bool invert = m_personality == PERSONALITY_SHARPCAP;
 
-                            for (int y = 0; y < Height; y++)
+                            for (int y0 = 0; y0 < Height; y0 += bandRows)
                             {
-                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
+                                int rows = Math.Min(bandRows, Height - y0);
 
-                                int destY = invert ? y : Height - y - 1;
+                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y0 * rowBytes), band, 0, rows * rowBytes);
 
-                                for (int x = 0, i = 0; x < Width; x++, i += 6)
+                                for (int x = 0; x < Width; x++)
                                 {
-                                    RGB[x, destY, rIndex] = row[i] + (row[i + 1] << 8);
-                                    RGB[x, destY, 1] = row[i + 2] + (row[i + 3] << 8);
-                                    RGB[x, destY, bIndex] = row[i + 4] + (row[i + 5] << 8);
+                                    for (int r = 0, i = x * 6; r < rows; r++, i += rowBytes)
+                                    {
+                                        int destY = invert ? y0 + r : Height - (y0 + r) - 1;
+
+                                        RGB[x, destY, rIndex] = band[i] + (band[i + 1] << 8);
+                                        RGB[x, destY, 1] = band[i + 2] + (band[i + 3] << 8);
+                                        RGB[x, destY, bIndex] = band[i + 4] + (band[i + 5] << 8);
+                                    }
                                 }
                             }
                         }

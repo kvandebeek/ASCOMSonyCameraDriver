@@ -18,6 +18,7 @@ namespace ASCOM.SonyMirrorless
         internal CaptureMode m_mode;
         internal ImageMode m_outputMode = ImageMode.RGB;
         internal CameraInfo m_resolutions;
+        private bool m_resolutionsQueried = false;
         internal Dictionary<UInt32, CameraProperty> m_properties = new Dictionary<UInt32, CameraProperty>();
         internal TraceLogger m_logger = null;
         internal Boolean m_bulbMode = false;
@@ -86,6 +87,7 @@ namespace ASCOM.SonyMirrorless
                         }
 
                         m_handle = handle;
+                        m_resolutionsQueried = false;
                     }
                 }
                 else
@@ -94,6 +96,12 @@ namespace ASCOM.SonyMirrorless
                     {
                         if (m_lastImage != null)
                         {
+                            // Don't close the device underneath a capture that is still running
+                            if (m_lastImage.m_status == SonyImage.ImageStatus.Capturing)
+                            {
+                                CancelCapture(m_handle, ref m_lastImage.m_info);
+                            }
+
                             m_lastImage.Cleanup();
                             m_lastImage = null;
                         }
@@ -204,6 +212,7 @@ namespace ASCOM.SonyMirrorless
             if (Mode.Preview)
             {
                 info.ImageMode = IMAGEMODE_RGB;
+                DateTime startTime = DateTime.UtcNow;
                 GetPreviewImage(m_handle, ref info);
 
                 // The DLL leaves Status untouched if it throws internally, so anything other than
@@ -218,7 +227,7 @@ namespace ASCOM.SonyMirrorless
                     throw new ASCOM.DriverException(String.Format("Unable to get liveview image (status {0})", info.Status));
                 }
 
-                m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger);
+                m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger, startTime);
             }
             else
             {
@@ -245,6 +254,9 @@ namespace ASCOM.SonyMirrorless
                     }
                 }
 
+                // Taken after the exposure time and ISO have been set (SetExposureTime can take seconds),
+                // so it is as close as we can get to the shutter opening
+                DateTime startTime = DateTime.UtcNow;
                 hr = StartCapture(m_handle, ref info);
 
                 if (hr != ERROR_SUCCESS)
@@ -252,7 +264,7 @@ namespace ASCOM.SonyMirrorless
                     throw new ASCOM.DriverException(String.Format("Unable to start exposure (error {0})", hr));
                 }
 
-                m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger);
+                m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger, startTime);
             }
 
             return m_lastImage;
@@ -270,7 +282,13 @@ namespace ASCOM.SonyMirrorless
         {
             get
             {
-                GetCameraInfo(m_handle, ref m_resolutions, INFOFLAG_ACTIVE);
+                // Each call makes the DLL re-read every camera setting over USB (and, for cameras it doesn't
+                // know yet, take test shots), so only ask once per connection
+                if (!m_resolutionsQueried)
+                {
+                    GetCameraInfo(m_handle, ref m_resolutions, INFOFLAG_ACTIVE);
+                    m_resolutionsQueried = true;
+                }
 
                 return m_resolutions;
             }
@@ -504,16 +522,27 @@ namespace ASCOM.SonyMirrorless
 
                     hr = GetPropertyDescriptor(m_handle, (uint)ids[i], ref descriptor);
 
-                    PropertyValueOption[] options = new PropertyValueOption[descriptor.ValueCount];
+                    if (hr != ERROR_SUCCESS)
+                    {
+                        // Descriptor would be all zeros - skip it rather than storing a bogus property 0
+                        Log(String.Format("GetPropertyDescriptor(x{0:x4}) failed with error {1}", ids[i], hr));
+                        continue;
+                    }
+
+                    List<PropertyValueOption> options = new List<PropertyValueOption>();
 
                     for (uint index = 0; index < descriptor.ValueCount; index++)
                     {
-                        GetPropertyValueOption(m_handle, descriptor.Id, ref options[index], index);
-//                        UInt32 countReturned = descriptor.ValueCount;
-//                        GetPropertyValueOptions(m_handle, descriptor.Id, ref options, ref countReturned);
+                        PropertyValueOption option = new PropertyValueOption();
+
+                        // A failed lookup leaves Value = 0, which would show up as an "ISO 0" gain
+                        if (GetPropertyValueOption(m_handle, descriptor.Id, ref option, index) == ERROR_SUCCESS)
+                        {
+                            options.Add(option);
+                        }
                     }
 
-                    m_properties[descriptor.Id] = new CameraProperty(descriptor, options);
+                    m_properties[descriptor.Id] = new CameraProperty(descriptor, options.ToArray());
                 }
             }
         }
