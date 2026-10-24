@@ -32,7 +32,8 @@ namespace ASCOM.SonyMirrorless
         {
             // Place any validation constraint checks here
             // Update the state variables with results from the dialogue
-            Camera.deviceId = (string)comboBoxCamera.SelectedItem;
+            // Keep the existing selection if the camera wasn't plugged in when the dialog opened
+            Camera.deviceId = (comboBoxCamera.SelectedItem as string) ?? Camera.deviceId;
             Camera.tl.Enabled = chkTrace.Checked;
             Camera.defaultReadoutMode = (short)comboBoxOutputFormat.SelectedValue;
             Camera.SaveRawImageData = checkBoxEnableSaveLocation.Checked;
@@ -43,7 +44,12 @@ namespace ASCOM.SonyMirrorless
             Camera.AutoLiveview = checkBoxAutoLiveview.Checked;
             Camera.Personality = (int)comboBoxPersonality.SelectedValue;
             Camera.BulbModeEnable = checkBoxBulbMode.Checked;
-            Camera.BulbModeTime = short.Parse(textBoxBulbMode.Text.Trim());
+            short bulbModeTime;
+
+            if (short.TryParse(textBoxBulbMode.Text.Trim(), out bulbModeTime))
+            {
+                Camera.BulbModeTime = bulbModeTime;
+            }
             Camera.AllowISOAdjust = checkBoxAllowISOAdjust.Checked;
         }
 

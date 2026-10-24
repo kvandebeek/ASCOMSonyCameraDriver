@@ -116,7 +116,15 @@ namespace ASCOM.SonyMirrorless
         internal static short BulbModeTime = 1;
         internal static bool AllowISOAdjust = false;
 
+        // True when the client explicitly asked for liveview (via FastReadout or ReadoutMode), in which
+        // case StartExposure must not switch back to full resolution
         internal static bool LastSetFastReadout = false;
+
+        // The camera and trace logger are shared by every instance of this class in the process, so only
+        // the last instance to be disposed may tear them down
+        private static int instanceCount = 0;
+        private static readonly object instanceLock = new object();
+        private bool disposed = false;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="a6400"/> class.
@@ -124,7 +132,15 @@ namespace ASCOM.SonyMirrorless
         /// </summary>
         public Camera()
         {
-            tl = new TraceLogger("", "SonyMirrorless");
+            lock (instanceLock)
+            {
+                if (tl == null)
+                {
+                    tl = new TraceLogger("", "SonyMirrorless");
+                }
+
+                instanceCount++;
+            }
 
             ReadProfile(); // Read device configuration from the ASCOM Profile store
 
@@ -222,17 +238,33 @@ namespace ASCOM.SonyMirrorless
 
         public void Dispose()
         {
-            LogMessage("Dispose", "Disposing");
-            // Clean up the tracelogger and util objects
-            if (camera != null)
+            if (disposed)
             {
-                Connected = false;
-                camera = null;
+                return;
             }
 
-            tl.Enabled = false;
-            tl.Dispose();
-            tl = null;
+            disposed = true;
+            LogMessage("Dispose", "Disposing");
+
+            lock (instanceLock)
+            {
+                instanceCount--;
+
+                // Only disconnect and clean up the tracelogger when no other instance is still using them
+                if (instanceCount == 0)
+                {
+                    if (camera != null)
+                    {
+                        Connected = false;
+                        camera = null;
+                    }
+
+                    tl.Enabled = false;
+                    tl.Dispose();
+                    tl = null;
+                }
+            }
+
             utilities.Dispose();
             utilities = null;
             astroUtilities.Dispose();
@@ -269,12 +301,16 @@ namespace ASCOM.SonyMirrorless
                         LogMessage("connected", "deviceId = '{0}'", deviceId);
 
                         // See if we can create a camera using deviceId
-                        if (deviceId == "")
+                        if (String.IsNullOrEmpty(deviceId))
                         {
                             SetupDialog();
                         }
 
-                        if (deviceId != "")
+                        if (String.IsNullOrEmpty(deviceId))
+                        {
+                            throw new ASCOM.NotConnectedException("No camera has been selected, see driver settings dialog");
+                        }
+                        else
                         {
                             SonyCameraEnumerator enumerator = new SonyCameraEnumerator();
 
@@ -303,6 +339,11 @@ namespace ASCOM.SonyMirrorless
                                     camera.BulbModeTime = BulbModeTime;
                                 }
                             }
+
+                            if (camera == null)
+                            {
+                                throw new ASCOM.NotConnectedException(String.Format("Camera '{0}' was not found, check it is switched on and connected via USB", deviceId));
+                            }
                         }
                     }
 
@@ -316,7 +357,17 @@ namespace ASCOM.SonyMirrorless
                         if (value)
                         {
                             LogMessage("Connected Set", "Connecting to camera {0}", deviceId);
-                            camera.Connected = true;
+
+                            try
+                            {
+                                camera.Connected = true;
+                            }
+                            catch
+                            {
+                                // Start from scratch next time in case the camera was replugged or swapped
+                                camera = null;
+                                throw;
+                            }
                         }
                         else
                         {
@@ -329,7 +380,7 @@ namespace ASCOM.SonyMirrorless
                     }
                     else
                     {
-                        tl.LogMessage("Connected Set", "Camera not yet specified");
+                        LogMessage("Connected Set", "Camera not yet specified");
                     }
                 }
             }
@@ -406,7 +457,7 @@ namespace ASCOM.SonyMirrorless
 
         public void AbortExposure()
         {
-            using (new SerializedAccess(this, "AbortExposure()"))
+            using (new SerializedAccess(this, "AbortExposure()", true))
             {
                 tl.LogMessage("AbortExposure", "Attempting to cancel any in-progress capture");
 
@@ -418,7 +469,7 @@ namespace ASCOM.SonyMirrorless
         {
             get
             {
-                using (new SerializedAccess(this, "get_BayerOffsetX"))
+                using (new SerializedAccess(this, "get_BayerOffsetX", true))
                 {
                     tl.LogMessage("BayerOffsetX Get Get", "");
 
@@ -431,7 +482,7 @@ namespace ASCOM.SonyMirrorless
         {
             get
             {
-                using (new SerializedAccess(this, "get_BayerOffsetY"))
+                using (new SerializedAccess(this, "get_BayerOffsetY", true))
                 {
                     tl.LogMessage("BayerOffsetY Get Get", "");
 
@@ -896,7 +947,7 @@ namespace ASCOM.SonyMirrorless
                 {
                     object result = null;
 
-                    if (camera.LastImage.Status != SonyImage.ImageStatus.Ready)
+                    if (camera.LastImage == null || camera.LastImage.Status != SonyImage.ImageStatus.Ready)
                     {
                         tl.LogMessage("ImageArray Get", "Throwing InvalidOperationException because of a call to ImageArray before the first image has been taken!");
                         throw new ASCOM.InvalidOperationException("Call to ImageArray before the first image has been taken!");
@@ -909,6 +960,12 @@ namespace ASCOM.SonyMirrorless
                     LogMessage("ImageArray", "requestedWidth = {0}, cameraNumX = {1}, camera.Mode.ImageWidth = {2}", (int)Math.Min(cameraNumX, camera.Mode.ImageWidthPixels), cameraNumX, camera.Mode.ImageWidthPixels);
 
                     tl.LogMessage("ImageArray Get", String.Format("(numX = {0}, numY = {1}, image.Width = {2}, image.Height = {3})", requestedWidth, requestedHeight, image.Width, image.Height));
+
+                    // StartX/StartY can be changed after the exposure was started, so check the subframe still fits
+                    if (StartX + requestedWidth > image.Width || StartY + requestedHeight > image.Height)
+                    {
+                        throw new ASCOM.InvalidValueException("ImageArray", String.Format("StartX={0}, StartY={1}, NumX={2}, NumY={3}", StartX, StartY, requestedWidth, requestedHeight), String.Format("a subframe within {0} x {1}", image.Width, image.Height));
+                    }
 
                     switch (image.m_info.ImageMode)
                     {
@@ -963,14 +1020,48 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_ImageArrayVariant", true))
                 {
-                    if (camera.LastImage.Status != SonyImage.ImageStatus.Ready)
+                    if (camera.LastImage == null || camera.LastImage.Status != SonyImage.ImageStatus.Ready)
                     {
                         tl.LogMessage("ImageArrayVariant Get", "Throwing InvalidOperationException because of a call to ImageArrayVariant before the first image has been taken!");
                         throw new ASCOM.InvalidOperationException("Call to ImageArrayVariant before the first image has been taken!");
                     }
-                    object[,,] cameraImageArrayVariant = new object[cameraNumX, cameraNumY, 3];
 
-                    return cameraImageArrayVariant;
+                    // Same data as ImageArray, boxed into an object array of the same shape
+                    object image = ImageArray;
+                    int[,] mono = image as int[,];
+
+                    if (mono != null)
+                    {
+                        object[,] variant = new object[mono.GetLength(0), mono.GetLength(1)];
+
+                        for (int x = 0; x < mono.GetLength(0); x++)
+                        {
+                            for (int y = 0; y < mono.GetLength(1); y++)
+                            {
+                                variant[x, y] = mono[x, y];
+                            }
+                        }
+
+                        return variant;
+                    }
+                    else
+                    {
+                        int[,,] colour = (int[,,])image;
+                        object[,,] variant = new object[colour.GetLength(0), colour.GetLength(1), colour.GetLength(2)];
+
+                        for (int x = 0; x < colour.GetLength(0); x++)
+                        {
+                            for (int y = 0; y < colour.GetLength(1); y++)
+                            {
+                                for (int z = 0; z < colour.GetLength(2); z++)
+                                {
+                                    variant[x, y, z] = colour[x, y, z];
+                                }
+                            }
+                        }
+
+                        return variant;
+                    }
                 }
             }
         }
@@ -1009,7 +1100,7 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_LastExposureDuration", true))
                 {
-                    if (camera.LastImage.Status != SonyImage.ImageStatus.Ready)
+                    if (camera.LastImage == null || camera.LastImage.Status != SonyImage.ImageStatus.Ready)
                     {
                         tl.LogMessage("LastExposureDuration Get", "Throwing InvalidOperationException because of a call to LastExposureDuration before the first image has been taken!");
                         throw new ASCOM.InvalidOperationException("Call to LastExposureDuration before the first image has been taken!");
@@ -1029,7 +1120,7 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_LastExposureStartTime", true))
                 {
-                    if (camera.LastImage.Status != SonyImage.ImageStatus.Ready)
+                    if (camera.LastImage == null || camera.LastImage.Status != SonyImage.ImageStatus.Ready)
                     {
                         tl.LogMessage("LastExposureStartTime Get", "Throwing InvalidOperationException because of a call to LastExposureStartTime before the first image has been taken!");
                         throw new ASCOM.InvalidOperationException("Call to LastExposureStartTime before the first image has been taken!");
@@ -1046,7 +1137,7 @@ namespace ASCOM.SonyMirrorless
         {
             get
             {
-                using (new SerializedAccess(this, "get_MaxADU"))
+                using (new SerializedAccess(this, "get_MaxADU", true))
                 {
                     int bpp = (int)camera.Info.BitsPerPixel;
                     int maxADU = (1 << bpp) - 1;
@@ -1107,6 +1198,8 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "set_NumX", true))
                 {
+                    if (value < 1) throw new ASCOM.InvalidValueException("NumX", value.ToString(), "1 upwards");
+
                     cameraNumX = value;
                     tl.LogMessage("NumX set", value.ToString());
                 }
@@ -1136,6 +1229,8 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "set_NumY", true))
                 {
+                    if (value < 1) throw new ASCOM.InvalidValueException("NumY", value.ToString(), "1 upwards");
+
                     // NINA sets this before it changes readout mode
                     cameraNumY = value;
                     tl.LogMessage("NumY set", value.ToString());
@@ -1198,16 +1293,19 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "get_ReadoutMode", true))
                 {
-                    tl.LogMessage("ReadoutMode Get", camera.OutputMode.ToString());
+                    // Index into ReadoutModes: 0 = full resolution, 1 = liveview - must match what the setter applies
+                    short mode = (short)(camera.PreviewMode ? 1 : 0);
 
-                    return (short)(camera.OutputMode - 1);
+                    tl.LogMessage("ReadoutMode Get", mode.ToString());
+
+                    return mode;
                 }
             }
             set
             {
                 using (new SerializedAccess(this, "set_ReadoutMode", true))
                 {
-                    if (ReadoutModes.Count > value)
+                    if (value >= 0 && ReadoutModes.Count > value)
                     {
                         tl.LogMessage("ReadoutMode Set", value.ToString());
 
@@ -1221,6 +1319,9 @@ namespace ASCOM.SonyMirrorless
                                 camera.PreviewMode = true;
                                 break;
                         }
+
+                        // Otherwise StartExposure switches straight back to full resolution
+                        LastSetFastReadout = camera.PreviewMode;
                     }
                     else
                     {
@@ -1357,6 +1458,8 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "set_StartX"))
                 {
+                    if (value < 0) throw new ASCOM.InvalidValueException("StartX", value.ToString(), "0 upwards");
+
                     cameraStartX = value;
 
                     tl.LogMessage("StartX Set", value.ToString());
@@ -1379,6 +1482,8 @@ namespace ASCOM.SonyMirrorless
             {
                 using (new SerializedAccess(this, "set_StartY"))
                 {
+                    if (value < 0) throw new ASCOM.InvalidValueException("StartY", value.ToString(), "0 upwards");
+
                     cameraStartY = value;
 
                     tl.LogMessage("StartY set", value.ToString());
@@ -1508,15 +1613,15 @@ namespace ASCOM.SonyMirrorless
             using (Profile driverProfile = new Profile())
             {
                 driverProfile.DeviceType = "Camera";
-                tl.Enabled = Convert.ToBoolean(driverProfile.GetValue(driverID, traceStateProfileName, string.Empty, traceStateDefault));
+                tl.Enabled = ReadProfileValue<bool>(driverProfile, traceStateProfileName, traceStateDefault, Convert.ToBoolean);
                 deviceId = driverProfile.GetValue(driverID, cameraProfileName, string.Empty, cameraDefault);
-                defaultReadoutMode = Convert.ToInt16(driverProfile.GetValue(driverID, readoutModeDefaultProfileName, string.Empty, readoutModeDefault));
-                UseLiveview = Convert.ToBoolean(driverProfile.GetValue(driverID, useLiveviewProfileName, string.Empty, useLiveviewDefault));
-                Personality = Convert.ToInt16(driverProfile.GetValue(driverID, personalityProfileName, string.Empty, personalityDefault));
-                AutoLiveview = Convert.ToBoolean(driverProfile.GetValue(driverID, autoLiveviewProfileName, string.Empty, autoLiveviewDefault));
-                BulbModeEnable = Convert.ToBoolean(driverProfile.GetValue(driverID, bulbModeEnableProfileName, string.Empty, bulbModeEnableDefault));
-                BulbModeTime = Convert.ToInt16(driverProfile.GetValue(driverID, bulbModeTimeProfileName, string.Empty, bulbModeTimeDefault));
-                AllowISOAdjust = Convert.ToBoolean(driverProfile.GetValue(driverID, allowISOAdjustProfileName, string.Empty, allowISOAdjustDefault));
+                defaultReadoutMode = ReadProfileValue<short>(driverProfile, readoutModeDefaultProfileName, readoutModeDefault, Convert.ToInt16);
+                UseLiveview = ReadProfileValue<bool>(driverProfile, useLiveviewProfileName, useLiveviewDefault, Convert.ToBoolean);
+                Personality = ReadProfileValue<short>(driverProfile, personalityProfileName, personalityDefault, Convert.ToInt16);
+                AutoLiveview = ReadProfileValue<bool>(driverProfile, autoLiveviewProfileName, autoLiveviewDefault, Convert.ToBoolean);
+                BulbModeEnable = ReadProfileValue<bool>(driverProfile, bulbModeEnableProfileName, bulbModeEnableDefault, Convert.ToBoolean);
+                BulbModeTime = ReadProfileValue<short>(driverProfile, bulbModeTimeProfileName, bulbModeTimeDefault, Convert.ToInt16);
+                AllowISOAdjust = ReadProfileValue<bool>(driverProfile, allowISOAdjustProfileName, allowISOAdjustDefault, Convert.ToBoolean);
 
                 if (defaultReadoutMode == 0)
                 {
@@ -1540,6 +1645,30 @@ namespace ASCOM.SonyMirrorless
                 LogMessage("ReadProfile", "Bulb Mode Enable:              {0}", BulbModeEnable.ToString());
                 LogMessage("ReadProfile", "Bulb Mode Time:                {0}", BulbModeTime.ToString());
             }
+        }
+
+        /// <summary>
+        /// Read a single profile value, falling back to the default if the stored value can't be parsed
+        /// (a corrupt value would otherwise stop the driver from being created at all)
+        /// </summary>
+        private static T ReadProfileValue<T>(Profile driverProfile, string name, string defaultValue, Func<string, T> convert)
+        {
+            string value = driverProfile.GetValue(driverID, name, string.Empty, defaultValue);
+
+            try
+            {
+                return convert(value);
+            }
+            catch (FormatException)
+            {
+            }
+            catch (OverflowException)
+            {
+            }
+
+            LogMessage("ReadProfile", "Invalid value '{0}' for '{1}', using default '{2}'", value, name, defaultValue);
+
+            return convert(defaultValue);
         }
 
         /// <summary>
@@ -1579,8 +1708,16 @@ namespace ASCOM.SonyMirrorless
         /// <param name="args"></param>
         internal static void LogMessage(string identifier, string message, params object[] args)
         {
+            TraceLogger logger = tl;
+
+            // Skip the formatting cost when tracing is off - this is called several times per property access
+            if (logger == null || !logger.Enabled)
+            {
+                return;
+            }
+
             var msg = string.Format(message, args);
-            tl.LogMessage(identifier, msg);
+            logger.LogMessage(identifier, msg);
         }
         #endregion
 
@@ -1652,25 +1789,44 @@ namespace ASCOM.SonyMirrorless
             {
                 m_cam = cam;
                 m_method = method;
-                LogMessage(m_method, "[enter] {0}", m_serialAccess.ToString());
+                LogMessage(m_method, "[enter]");
 
+                try
+                {
+                    if (!m_serialAccess.WaitOne(1000))
+                    {
+                        LogMessage(m_method, "Waiting to enter");
+                        m_serialAccess.WaitOne();
+                    }
+                }
+                catch (AbandonedMutexException)
+                {
+                    // A thread died while holding the lock - we now own it, so carry on rather than failing every call from here on
+                    LogMessage(m_method, "Previous owner abandoned the lock");
+                }
+
+                // Check while holding the lock, otherwise another thread could disconnect (and null the camera)
+                // between the check and the caller using it
                 if (checkConnected)
                 {
-                    m_cam.CheckConnected(String.Format("Camera must be connected before '{0}' can be called", method));
+                    try
+                    {
+                        m_cam.CheckConnected(String.Format("Camera must be connected before '{0}' can be called", method));
+                    }
+                    catch
+                    {
+                        // Dispose won't be called if the constructor throws
+                        m_serialAccess.ReleaseMutex();
+                        throw;
+                    }
                 }
 
-                if (!m_serialAccess.WaitOne(1000))
-                {
-                    LogMessage(m_method, "Waiting to enter {0}", m_serialAccess.ToString());
-                    m_serialAccess.WaitOne();
-                }
-
-                LogMessage(m_method, "[in] {0}", m_serialAccess.ToString());
+                LogMessage(m_method, "[in]");
             }
 
             public void Dispose()
             {
-                LogMessage(m_method, "[out] {0}", m_serialAccess.ToString());
+                LogMessage(m_method, "[out]");
                 m_serialAccess.ReleaseMutex();
             }
         }

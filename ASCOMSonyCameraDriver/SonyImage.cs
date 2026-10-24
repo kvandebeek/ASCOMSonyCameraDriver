@@ -75,9 +75,10 @@ namespace ASCOM.SonyMirrorless
                                 Log("get_Status - latest = Failed");
                                 break;
 
-                            case STATUS_STARTING: // Getting ready to press button
-                            case STATUS_EXPOSING: // Button is down
-                            case STATUS_READING:  // Reading from camera, not driver
+                            case STATUS_STARTING:   // Getting ready to press button
+                            case STATUS_EXPOSING:   // Button is down
+                            case STATUS_READING:    // Reading from camera, not driver
+                            case STATUS_PROCESSING: // Camera DLL is converting the image
                                 m_status = ImageStatus.Capturing;
                                 Log("get_Status - latest = Capturing");
                                 break;
@@ -85,9 +86,19 @@ namespace ASCOM.SonyMirrorless
                             case STATUS_COMPLETE:
                                 m_status = ImageStatus.Reading;
                                 Log("get_Status - latest = Reading");
-                                ProcessImageData();
-                                m_status = ImageStatus.Ready;
-                                Log("get_Status - latest = Reading");
+
+                                try
+                                {
+                                    ProcessImageData();
+                                    m_status = ImageStatus.Ready;
+                                    Log("get_Status - latest = Ready");
+                                }
+                                catch (Exception e)
+                                {
+                                    // Without this the image would be stuck in "Reading" forever
+                                    m_status = ImageStatus.Failed;
+                                    Log(String.Format("get_Status - unable to process image data, marking as Failed: {0}", e.Message));
+                                }
                                 break;
 
                             default:
@@ -116,8 +127,6 @@ namespace ASCOM.SonyMirrorless
 
         public void ProcessImageData()
         {
-            byte[] returndata = null;
-
             Log("Processing Image Data - in");
 
             try
@@ -127,21 +136,38 @@ namespace ASCOM.SonyMirrorless
                 Log(String.Format("m_info.Height    = {0}", m_info.Height.ToString()));
                 Log(String.Format("m_info.ImageMode = {0}", m_info.ImageMode.ToString()));
 
-                int numValues = (Int32)m_info.ImageSize / sizeof(ushort);
-
-                Log(String.Format("Allocating {0} bytes", numValues.ToString()));
-
-                returndata = new byte[m_info.ImageSize];
-
-                if (returndata == null)
-                {
-                    Log("Unable to allocate memory for image");
-                }
-
                 Width = (int)m_info.Width;
                 Height = (int)m_info.Height;
 
-                Marshal.Copy(m_info.ImageData, returndata, 0, (Int32)m_info.ImageSize);
+                int bytesPerPixel;
+
+                switch (m_info.ImageMode)
+                {
+                    case IMAGEMODE_RAW:
+                        bytesPerPixel = 2;
+                        break;
+
+                    case IMAGEMODE_RGB:
+                        bytesPerPixel = 6;
+                        break;
+
+                    default:
+                        throw new ASCOM.DriverException(String.Format("Unsupported image mode {0}", m_info.ImageMode));
+                }
+
+                // Make sure the DLL actually handed over enough data for the dimensions it reported,
+                // otherwise we'd index past the end of the buffer
+                long expectedSize = (long)Width * Height * bytesPerPixel;
+
+                if (m_info.ImageData == IntPtr.Zero || Width <= 0 || Height <= 0 || m_info.ImageSize < expectedSize)
+                {
+                    throw new ASCOM.DriverException(String.Format("Image data is incomplete: got {0} bytes, expected {1} for {2} x {3}", m_info.ImageSize, expectedSize, Width, Height));
+                }
+
+                // Copy one row at a time rather than the whole image - a full-size copy of a 60MP
+                // RGB image is 360MB, which 32-bit hosts frequently can't allocate
+                int rowBytes = Width * bytesPerPixel;
+                byte[] row = new byte[rowBytes];
 
                 switch (m_info.ImageMode)
                 {
@@ -154,27 +180,26 @@ namespace ASCOM.SonyMirrorless
 
                         int mi = int.MaxValue, ma = int.MinValue;
 
-                        for (int i = 0; i < m_info.ImageSize; i += 2)
+                        for (int y = 0; y < Height; y++)
                         {
-                            int x = (i / 2) % Width;
-                            int y = (i / 2) / Width;
+                            Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
 
-                            int v = returndata[i] + (returndata[i + 1] << 8);
+                            int destY = Height - y - 1;
 
-                            if (v < mi) { mi = v; }
-                            if (v > ma) { ma = v; }
-                            BAYER[x, Height - y - 1] = v; // returndata[i] + (returndata[i + 1] << 8);
-                            /* if (x < 20 && y < 20)
+                            for (int x = 0, i = 0; x < Width; x++, i += 2)
                             {
-                                Log(String.Format("({0}, {1}): [{2},{3}] => {4}", x, Height - y - 1, returndata[i], returndata[i + 1], BAYER[x, Height - y - 1]));
-                            } */
+                                int v = row[i] + (row[i + 1] << 8);
+
+                                if (v < mi) { mi = v; }
+                                if (v > ma) { ma = v; }
+                                BAYER[x, destY] = v;
+                            }
                         }
 
                         Log(String.Format("min pixel = {0}, max pixel = {1}", mi, ma));
                         break;
 
                     case IMAGEMODE_RGB:
-                        // Reuse previous array
                         if (m_personality == PERSONALITY_NINA)
                         {
                             // NINA doesn't support multi-channel images, so convert the RGB To Mono
@@ -185,15 +210,19 @@ namespace ASCOM.SonyMirrorless
                                 BAYER = new int[Width, Height];
                             }
 
-                            for (int i = 0; i < m_info.ImageSize; i += 6)
+                            for (int y = 0; y < Height; y++)
                             {
-                                int x = (i / 6) % Width;
-                                int y = Height - ((i / 6) / Width) - 1;
-                                int r = returndata[i] + (returndata[i + 1] << 8);
-                                int g = returndata[i + 2] + (returndata[i + 3] << 8);
-                                int b = returndata[i + 4] + (returndata[i + 5] << 8);
+                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
 
-                                BAYER[x, Height - y - 1] = (short)((0.2125 * r) + (0.7154 * g) + (0.0721 * b));
+                                for (int x = 0, i = 0; x < Width; x++, i += 6)
+                                {
+                                    int r = row[i] + (row[i + 1] << 8);
+                                    int g = row[i + 2] + (row[i + 3] << 8);
+                                    int b = row[i + 4] + (row[i + 5] << 8);
+
+                                    // Previously cast to short, which wrapped bright pixels (> 32767) to negative values
+                                    BAYER[x, y] = Math.Min(65535, (int)((0.2125 * r) + (0.7154 * g) + (0.0721 * b)));
+                                }
                             }
                         }
                         else
@@ -203,17 +232,22 @@ namespace ASCOM.SonyMirrorless
                                 RGB = new int[Width, Height, 3];
                             }
 
-                            bool switchRB = m_readoutMode == OUTPUTFORMAT_BGR;
+                            int rIndex = m_readoutMode == OUTPUTFORMAT_BGR ? 2 : 0;
+                            int bIndex = 2 - rIndex;
                             bool invert = m_personality == PERSONALITY_SHARPCAP;
 
-                            for (int i = 0; i < m_info.ImageSize; i += 6)
+                            for (int y = 0; y < Height; y++)
                             {
-                                int x = (i / 6) % Width;
-                                int y = invert ? (i / 6) / Width : Height - ((i / 6) / Width) - 1;
+                                Marshal.Copy(IntPtr.Add(m_info.ImageData, y * rowBytes), row, 0, rowBytes);
 
-                                RGB[x, y, switchRB ? 2 : 0] = returndata[i] + (returndata[i + 1] << 8);
-                                RGB[x, y, 1] = returndata[i + 2] + (returndata[i + 3] << 8);
-                                RGB[x, y, switchRB ? 0 : 2] = returndata[i + 4] + (returndata[i + 5] << 8);
+                                int destY = invert ? y : Height - y - 1;
+
+                                for (int x = 0, i = 0; x < Width; x++, i += 6)
+                                {
+                                    RGB[x, destY, rIndex] = row[i] + (row[i + 1] << 8);
+                                    RGB[x, destY, 1] = row[i + 2] + (row[i + 3] << 8);
+                                    RGB[x, destY, bIndex] = row[i + 4] + (row[i + 5] << 8);
+                                }
                             }
                         }
                         break;
@@ -221,8 +255,6 @@ namespace ASCOM.SonyMirrorless
             }
             finally
             {
-                returndata = null;
-
                 Cleanup();
             }
 

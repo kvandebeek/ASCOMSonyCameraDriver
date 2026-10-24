@@ -69,14 +69,35 @@ namespace ASCOM.SonyMirrorless
                 {
                     if (m_handle == INVALID_HANDLE_VALUE)
                     {
-                        m_handle = OpenDevice(m_info.DeviceName);
-                        GetCameraInfo(m_handle, ref m_resolutions, 0);
+                        UInt32 handle = OpenDevice(m_info.DeviceName);
+
+                        if (handle == INVALID_HANDLE_VALUE)
+                        {
+                            throw new ASCOM.NotConnectedException(String.Format("Unable to open camera '{0}'", DisplayName));
+                        }
+
+                        UInt32 hr = GetCameraInfo(handle, ref m_resolutions, 0);
+
+                        if (hr != ERROR_SUCCESS)
+                        {
+                            CloseDevice(handle);
+
+                            throw new ASCOM.NotConnectedException(String.Format("Unable to read camera info from '{0}' (error {1})", DisplayName, hr));
+                        }
+
+                        m_handle = handle;
                     }
                 }
                 else
                 {
-                    if (m_handle != 1)
+                    if (m_handle != INVALID_HANDLE_VALUE)
                     {
+                        if (m_lastImage != null)
+                        {
+                            m_lastImage.Cleanup();
+                            m_lastImage = null;
+                        }
+
                         CloseDevice(m_handle);
                     }
 
@@ -141,6 +162,10 @@ namespace ASCOM.SonyMirrorless
                         case SonyImage.ImageStatus.Reading:
                             return CameraStates.cameraReading;
 
+                        case SonyImage.ImageStatus.Failed:
+                            // Lets the client know the exposure isn't going to complete
+                            return CameraStates.cameraError;
+
                         default:
                             return CameraStates.cameraIdle;
                     }
@@ -180,22 +205,53 @@ namespace ASCOM.SonyMirrorless
             {
                 info.ImageMode = IMAGEMODE_RGB;
                 GetPreviewImage(m_handle, ref info);
+
+                // The DLL leaves Status untouched if it throws internally, so anything other than
+                // Complete means we didn't get an image - and polling for one would never finish
+                if (info.Status != STATUS_COMPLETE)
+                {
+                    if (info.ImageData != IntPtr.Zero)
+                    {
+                        Marshal.FreeCoTaskMem(info.ImageData);
+                    }
+
+                    throw new ASCOM.DriverException(String.Format("Unable to get liveview image (status {0})", info.Status));
+                }
+
                 m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger);
             }
             else
             {
+                UInt32 hr;
+
                 if (m_bulbMode)
                 {
                     PropertyValue pv = new PropertyValue();
-                    SetExposureTime(m_handle, (float)(duration > m_bulbModeTime ? 0 : duration), ref pv);
+                    hr = SetExposureTime(m_handle, (float)(duration > m_bulbModeTime ? 0 : duration), ref pv);
+
+                    if (hr != ERROR_SUCCESS)
+                    {
+                        Log(String.Format("SetExposureTime({0}) failed with error {1}", duration, hr));
+                    }
                 }
 
                 if (m_desiredGain != -1 && Gains.Count > 0)
                 {
-                    SetPropertyValue(m_handle, SonyCommon.PROPERTY_ISO, UInt32.Parse((string)Gains[m_desiredGain]));
+                    hr = SetPropertyValue(m_handle, SonyCommon.PROPERTY_ISO, UInt32.Parse((string)Gains[m_desiredGain]));
+
+                    if (hr != ERROR_SUCCESS)
+                    {
+                        Log(String.Format("Setting ISO to {0} failed with error {1}", Gains[m_desiredGain], hr));
+                    }
                 }
 
-                StartCapture(m_handle, ref info);
+                hr = StartCapture(m_handle, ref info);
+
+                if (hr != ERROR_SUCCESS)
+                {
+                    throw new ASCOM.DriverException(String.Format("Unable to start exposure (error {0})", hr));
+                }
+
                 m_lastImage = new SonyImage(m_handle, info, personality, readoutMode, m_logger);
             }
 
@@ -324,6 +380,12 @@ namespace ASCOM.SonyMirrorless
                 {
                     CameraProperty iso = GetProperty(SonyCommon.PROPERTY_ISO_OPTIONS);
 
+                    if (iso == null)
+                    {
+                        // Camera doesn't report a list of ISO values - leave the list empty
+                        return m_gains;
+                    }
+
                     SonyCommon.PropertyValueOption[] options = iso.Options;
 
                     foreach (SonyCommon.PropertyValueOption option in options)
@@ -346,9 +408,24 @@ namespace ASCOM.SonyMirrorless
         {
             get
             {
+                // The requested gain is only sent to the camera when the next exposure starts, so report
+                // that rather than the camera's current value - otherwise a get straight after a set
+                // returns the old value
+                if (m_desiredGain != -1)
+                {
+                    Log(String.Format("get GainIndex: returning pending index {0}", m_desiredGain));
+
+                    return m_desiredGain;
+                }
+
                 RefreshProperties();
 
                 CameraProperty iso = GetProperty(SonyCommon.PROPERTY_ISO);
+
+                if (iso == null)
+                {
+                    throw new ASCOM.DriverException("Camera does not report its ISO setting");
+                }
 
                 UInt32 value = iso.CurrentValue(m_handle).Value;
                 short index = (short)Gains.IndexOf(value.ToString());
@@ -364,16 +441,18 @@ namespace ASCOM.SonyMirrorless
                 {
                     m_desiredGain = value;
                 }
-                else if (value >= Gains.Count)
+                else
                 {
                     Log(String.Format("Attempting to find gain {0} match", value));
                     int desiredIndex = Gains.IndexOf(value.ToString());
 
-                    if (desiredIndex >= 0)
+                    if (desiredIndex < 0)
                     {
-                        Log(String.Format("Setting gain to index {0} which matches {1}", desiredIndex, value));
-                        m_desiredGain = (short)desiredIndex;
+                        throw new ASCOM.InvalidValueException("Gain", value.ToString(), String.Format("0 to {0}", Gains.Count - 1));
                     }
+
+                    Log(String.Format("Setting gain to index {0} which matches {1}", desiredIndex, value));
+                    m_desiredGain = (short)desiredIndex;
                 }
             }
         }
@@ -388,13 +467,35 @@ namespace ASCOM.SonyMirrorless
 
                 // Get # of properties
                 UInt32 hr = GetPropertyList(m_handle, IntPtr.Zero, ref count);
-                int[] ids = new int[count];
-                IntPtr pIds = Marshal.AllocCoTaskMem((int)count * sizeof(UInt32));
 
-                hr = GetPropertyList(m_handle, pIds, ref count);
+                if (count == 0)
+                {
+                    Log(String.Format("GetPropertyList returned no properties (error {0})", hr));
+                    return;
+                }
 
-                Marshal.Copy(pIds, ids, 0, (int)count);
-                Marshal.FreeCoTaskMem(pIds);
+                // The DLL fills the list without checking its size, so leave headroom in case the
+                // camera advertises more properties between the two calls
+                UInt32 allocated = count + 32;
+                int[] ids = new int[allocated];
+                IntPtr pIds = Marshal.AllocCoTaskMem((int)allocated * sizeof(UInt32));
+
+                try
+                {
+                    hr = GetPropertyList(m_handle, pIds, ref count);
+
+                    if (hr != ERROR_SUCCESS)
+                    {
+                        Log(String.Format("GetPropertyList failed with error {0}", hr));
+                        return;
+                    }
+
+                    Marshal.Copy(pIds, ids, 0, (int)count);
+                }
+                finally
+                {
+                    Marshal.FreeCoTaskMem(pIds);
+                }
 
                 // Now I want the property descriptors
                 for (int i = 0; i < count; i++)

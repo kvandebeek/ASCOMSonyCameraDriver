@@ -16,6 +16,7 @@ namespace ASCOM.SonyMirrorless
         protected const UInt32 STATUS_COMPLETE = 0x04;
         protected const UInt32 STATUS_STARTING = 0x8001;
         protected const UInt32 STATUS_READING = 0x8002;
+        protected const UInt32 STATUS_PROCESSING = 0x8003;
         protected const UInt32 FORMAT_ARW = 0xb101;
         protected const UInt32 FORMAT_JPEG = 0x3801;
         protected const UInt32 IMAGEMODE_RAW = 1;
